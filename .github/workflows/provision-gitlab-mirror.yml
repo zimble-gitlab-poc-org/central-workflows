@@ -163,8 +163,9 @@ jobs:
 
             console.log("\nConfiguring pull mirroring...");
             await glFetch("PUT", `/projects/${projectId}/mirror/pull`, {
-              enabled: true,
-              url: authCloneUrl
+              enabled:        true,
+              trigger_builds: true,   // fire a pipeline every time the mirror syncs
+              url:            authCloneUrl
             });
 
             console.log(" Pull mirroring enabled/updated.");
