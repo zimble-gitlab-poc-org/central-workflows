@@ -174,27 +174,33 @@ jobs:
             console.log(`Waiting ${MIRROR_SETTLE_MS / 1000}s for mirror to settle...`);
             await new Promise(r => setTimeout(r, MIRROR_SETTLE_MS));
 
-            // ── Step 4: Poll loop — retry pipeline creation until it succeeds ──
+            // ── Step 4: Poll loop ─────────────────────────────────────────────
             //
-            // Pipeline creation fails with "Reference not found" when the mirror
-            // hasn't synced the branch yet. Instead of giving up after one attempt,
-            // we retry creation every poll interval until it succeeds, then track
-            // that pipeline to completion.
+            // Each iteration:
+            //   a) Try to create a pipeline for the PR branch.
+            //   b) If creation fails ("Reference not found") the mirror hasn't
+            //      synced yet — retry next tick.
+            //   c) If creation succeeds but the pipeline SHA != prSha, the mirror
+            //      synced an older commit — cancel that stale pipeline and retry.
+            //      This was the core bug: a pipeline on the wrong SHA would pass
+            //      and report success to GitHub for code it never actually tested.
+            //   d) Once we have a pipeline whose SHA matches prSha, track it to
+            //      completion and post the real result back to GitHub.
 
             const TERMINAL_STATUSES    = new Set(["success", "failed", "canceled", "skipped", "blocked"]);
             const IN_PROGRESS_STATUSES = new Set(["created", "waiting_for_resource", "preparing", "pending", "running"]);
 
             let pipeline   = null;
-            let pipelineId = null;   // set once pipeline is successfully created
+            let pipelineId = null;
             let elapsed    = 0;
 
-            console.log(`\nStarting pipeline creation + poll loop for branch '${prBranch}'...`);
+            console.log(`\nStarting pipeline creation + poll loop for branch '${prBranch}' SHA=${prSha}...`);
 
             while (elapsed < MAX_WAIT_MS) {
               await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
               elapsed += POLL_INTERVAL_MS;
 
-              // If we don't have a pipeline yet, keep trying to create one
+              // Try to create a pipeline if we don't have a valid one yet
               if (!pipelineId) {
                 try {
                   const created = await glFetch(
@@ -202,9 +208,30 @@ jobs:
                     `/projects/${projectId}/pipeline`,
                     { ref: prBranch }
                   );
+
+                  // ── SHA check ──────────────────────────────────────────────
+                  // The pipeline was created against whatever commit GitLab
+                  // currently has for this branch. If the mirror hasn't fetched
+                  // our commit yet, this will be an older SHA.
+                  if (created.sha !== prSha) {
+                    console.log(
+                      `  [${Math.round(elapsed / 1000)}s] Pipeline #${created.id} created but SHA mismatch` +
+                      ` (got ${created.sha.slice(0, 8)}, want ${prSha.slice(0, 8)}).` +
+                      ` Mirror hasn't synced yet — canceling stale pipeline and retrying.`
+                    );
+                    // Cancel the stale pipeline so it doesn't waste runner resources
+                    try {
+                      await glFetch("POST", `/projects/${projectId}/pipelines/${created.id}/cancel`);
+                    } catch (cancelErr) {
+                      core.warning(`Could not cancel stale pipeline: ${cancelErr.message}`);
+                    }
+                    continue;  // retry next tick
+                  }
+
+                  // SHA matches — this is the pipeline we want
                   pipelineId = created.id;
                   console.log(
-                    `  [${Math.round(elapsed / 1000)}s] Pipeline created: #${pipelineId} status=${created.status}`
+                    `  [${Math.round(elapsed / 1000)}s] Pipeline created: #${pipelineId} SHA=${created.sha.slice(0, 8)} status=${created.status}`
                   );
                   await postGitHubStatus(
                     "pending",
