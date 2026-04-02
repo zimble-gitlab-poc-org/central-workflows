@@ -1,41 +1,5 @@
 name: GitLab CI Status Bridge
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CENTRAL reusable workflow — lives in central-workflows repo.
-#
-# Each application repo gets a thin caller pushed by repo-provisioning.yml:
-#
-#   .github/workflows/gitlab-pr-bridge.yml
-#       on: pull_request [opened, reopened, synchronize]
-#       permissions: { contents: read, statuses: write }
-#       jobs:
-#         bridge:
-#           uses: <org>/central-workflows/.github/workflows/gitlab-pr-status.yml@main
-#           secrets: inherit
-#
-# GitHub forwards the pull_request event context (SHA, branch, number) from
-# the caller into this workflow automatically.
-#
-# What this does:
-#   1. Posts "pending" on the PR commit immediately.
-#   2. Triggers a GitLab mirror refresh so GitLab fetches the branch now.
-#   3. Polls GitLab until a pipeline for the exact commit SHA completes
-#      (or the 30 min timeout is reached).
-#   4. Posts success / failure / error back to the GitHub commit.
-#      Branch protection reads this and blocks merge if it fails.
-#
-# Required secrets (inherited via `secrets: inherit` in the thin caller):
-#   GITLAB_HOST               – e.g. https://gitlab.example.com
-#   GITLAB_API_TOKEN          – token with api scope on the mirrored project
-#   GITLAB_TOP_LEVEL_GROUP_ID – numeric ID of the top-level GitLab group
-#   GITLAB_ORG_SUBGROUP       – default second-level subgroup (no-tenant path)
-#
-# One-time GitHub branch protection setup (per repo):
-#   Settings → Branches → Branch protection rule → default branch
-#   ✓ Require status checks to pass before merging
-#   Add check: "gitlab-ci/pipeline"
-# ─────────────────────────────────────────────────────────────────────────────
-
 on:
   workflow_call:
 
@@ -46,7 +10,7 @@ permissions:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 35   # 30 min pipeline timeout + 5 min API overhead
+    timeout-minutes: 35
 
     steps:
       - name: Relay GitLab pipeline status to this PR commit
@@ -63,14 +27,11 @@ jobs:
             const TOP_LEVEL_GROUP_ID = process.env.GITLAB_TOP_LEVEL_GROUP_ID;
             const ORG_SUBGROUP       = process.env.GITLAB_ORG_SUBGROUP;
 
-            // Status context name — must match the string added to branch protection.
-            const STATUS_CONTEXT = "gitlab-ci/pipeline";
-
+            const STATUS_CONTEXT   = "gitlab-ci/pipeline";
             const MIRROR_SETTLE_MS = 30_000;
             const POLL_INTERVAL_MS = 20_000;
             const MAX_WAIT_MS      = 30 * 60_000;
 
-            // PR metadata forwarded from calling repo's pull_request event
             const prSha    = context.payload.pull_request.head.sha;
             const prBranch = context.payload.pull_request.head.ref;
             const prNumber = context.payload.pull_request.number;
@@ -113,7 +74,7 @@ jobs:
               return data;
             }
 
-            // ── Step 1: Resolve GitLab project from this repo's topics ─────────
+            // ── Step 1: Resolve GitLab project from repo topics ────────────────
             const { data: topicData } = await github.rest.repos.getAllTopics({
               owner: context.repo.owner,
               repo:  context.repo.repo
@@ -153,7 +114,7 @@ jobs:
             const secondLevelPath = tenant ?? ORG_SUBGROUP;
             const secondLevel     = await findSubgroup(TOP_LEVEL_GROUP_ID, secondLevelPath);
             if (!secondLevel) {
-              const msg = `GitLab group '${secondLevelPath}' not found under top-level group.`;
+              const msg = `GitLab group '${secondLevelPath}' not found.`;
               await postGitHubStatus("error", msg);
               core.setFailed(msg);
               return;
@@ -201,17 +162,50 @@ jobs:
               `${projectUrl}/-/pipelines`
             );
 
-            // ── Step 3: Trigger mirror refresh ────────────────────────────────
+            // ── Step 3: Trigger mirror refresh then explicitly create pipeline ──
+            //
+            // We do NOT rely on trigger_builds (inconsistently supported on
+            // GitLab.com). Instead we:
+            //   a) trigger mirror refresh so GitLab fetches the latest commit
+            //   b) wait for mirror to settle
+            //   c) explicitly create a pipeline for the PR branch via API
+            //
+            // This is more reliable — we control exactly when the pipeline fires.
+
             console.log("\nTriggering GitLab mirror refresh...");
             try {
               await glFetch("POST", `/projects/${projectId}/mirror/pull`);
               console.log("  Mirror refresh triggered.");
             } catch (err) {
-              core.warning(`Mirror refresh call failed (will still poll): ${err.message}`);
+              core.warning(`Mirror refresh call failed: ${err.message}`);
             }
 
             console.log(`Waiting ${MIRROR_SETTLE_MS / 1000}s for mirror to settle...`);
             await new Promise(r => setTimeout(r, MIRROR_SETTLE_MS));
+
+            // Explicitly create a pipeline for the PR branch.
+            // GitLab will use the latest commit on that ref (which is now our SHA
+            // after the mirror synced it).
+            console.log(`\nCreating GitLab pipeline for branch '${prBranch}'...`);
+            let createdPipeline = null;
+            try {
+              createdPipeline = await glFetch(
+                "POST",
+                `/projects/${projectId}/pipeline`,
+                { ref: prBranch }
+              );
+              console.log(`  Pipeline created: #${createdPipeline.id} status=${createdPipeline.status}`);
+
+              await postGitHubStatus(
+                "pending",
+                `GitLab pipeline #${createdPipeline.id} is ${createdPipeline.status}…`,
+                `${projectUrl}/-/pipelines/${createdPipeline.id}`
+              );
+            } catch (err) {
+              // Pipeline creation can fail if the branch doesn't exist in GitLab yet
+              // (mirror hasn't synced). Fall through to polling which will also check.
+              core.warning(`Explicit pipeline creation failed: ${err.message}. Will poll for any pipeline on this branch.`);
+            }
 
             // ── Step 4: Poll for pipeline matching our exact SHA ───────────────
             const TERMINAL_STATUSES    = new Set(["success", "failed", "canceled", "skipped", "blocked"]);
@@ -220,50 +214,73 @@ jobs:
             let pipeline = null;
             let elapsed  = 0;
 
+            // If we created a pipeline, poll it directly by ID for efficiency.
+            // If creation failed, fall back to scanning all pipelines for the branch.
+            const pollById = createdPipeline?.id ?? null;
+
             console.log(`\nPolling GitLab for pipeline on '${prBranch}' SHA=${prSha}...`);
 
             while (elapsed < MAX_WAIT_MS) {
               await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
               elapsed += POLL_INTERVAL_MS;
 
-              let pipelines;
               try {
-                pipelines = await glFetch(
-                  "GET",
-                  `/projects/${projectId}/pipelines` +
-                  `?ref=${encodeURIComponent(prBranch)}&per_page=10`
-                );
-              } catch (err) {
-                core.warning(`Pipeline fetch failed (will retry): ${err.message}`);
-                continue;
-              }
+                if (pollById) {
+                  // Poll the specific pipeline we created
+                  const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pollById}`);
+                  const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
 
-              const exact = pipelines.find(p => p.sha === prSha);
+                  console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`);
 
-              if (exact) {
-                pipeline = exact;
-                const pipelineUrl = `${projectUrl}/-/pipelines/${pipeline.id}`;
-                console.log(
-                  `  [${Math.round(elapsed / 1000)}s] Pipeline #${pipeline.id} status=${pipeline.status}`
-                );
+                  if (IN_PROGRESS_STATUSES.has(p.status)) {
+                    await postGitHubStatus(
+                      "pending",
+                      `GitLab pipeline #${p.id} is ${p.status}…`,
+                      pipelineUrl
+                    );
+                  }
 
-                if (IN_PROGRESS_STATUSES.has(pipeline.status)) {
-                  await postGitHubStatus(
-                    "pending",
-                    `GitLab pipeline #${pipeline.id} is ${pipeline.status}…`,
-                    pipelineUrl
+                  if (TERMINAL_STATUSES.has(p.status)) {
+                    pipeline = p;
+                    console.log(`  Pipeline finished: ${p.status}`);
+                    break;
+                  }
+                } else {
+                  // Fallback: scan all pipelines for the branch and match by SHA
+                  const pipelines = await glFetch(
+                    "GET",
+                    `/projects/${projectId}/pipelines` +
+                    `?ref=${encodeURIComponent(prBranch)}&per_page=10`
                   );
-                }
 
-                if (TERMINAL_STATUSES.has(pipeline.status)) {
-                  console.log(`  Pipeline finished: ${pipeline.status}`);
-                  break;
+                  const exact = pipelines.find(p => p.sha === prSha);
+
+                  if (exact) {
+                    const pipelineUrl = `${projectUrl}/-/pipelines/${exact.id}`;
+                    console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${exact.id} status=${exact.status}`);
+
+                    if (IN_PROGRESS_STATUSES.has(exact.status)) {
+                      await postGitHubStatus(
+                        "pending",
+                        `GitLab pipeline #${exact.id} is ${exact.status}…`,
+                        pipelineUrl
+                      );
+                    }
+
+                    if (TERMINAL_STATUSES.has(exact.status)) {
+                      pipeline = exact;
+                      console.log(`  Pipeline finished: ${exact.status}`);
+                      break;
+                    }
+                  } else {
+                    console.log(
+                      `  [${Math.round(elapsed / 1000)}s] No pipeline for this SHA yet ` +
+                      `(${pipelines.length} recent pipelines for branch).`
+                    );
+                  }
                 }
-              } else {
-                console.log(
-                  `  [${Math.round(elapsed / 1000)}s] No pipeline for this SHA yet ` +
-                  `(${pipelines.length} recent pipelines for branch).`
-                );
+              } catch (err) {
+                core.warning(`Poll failed (will retry): ${err.message}`);
               }
             }
 
@@ -271,7 +288,7 @@ jobs:
             if (!pipeline) {
               await postGitHubStatus(
                 "error",
-                "GitLab pipeline did not start within the timeout. Check mirror sync settings.",
+                "GitLab pipeline did not complete within the timeout.",
                 `${projectUrl}/-/pipelines`
               );
               core.setFailed("Timed out waiting for GitLab pipeline.");
