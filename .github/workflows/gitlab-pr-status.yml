@@ -162,16 +162,7 @@ jobs:
               `${projectUrl}/-/pipelines`
             );
 
-            // ── Step 3: Trigger mirror refresh then explicitly create pipeline ──
-            //
-            // We do NOT rely on trigger_builds (inconsistently supported on
-            // GitLab.com). Instead we:
-            //   a) trigger mirror refresh so GitLab fetches the latest commit
-            //   b) wait for mirror to settle
-            //   c) explicitly create a pipeline for the PR branch via API
-            //
-            // This is more reliable — we control exactly when the pipeline fires.
-
+            // ── Step 3: Trigger mirror refresh ────────────────────────────────
             console.log("\nTriggering GitLab mirror refresh...");
             try {
               await glFetch("POST", `/projects/${projectId}/mirror/pull`);
@@ -183,104 +174,76 @@ jobs:
             console.log(`Waiting ${MIRROR_SETTLE_MS / 1000}s for mirror to settle...`);
             await new Promise(r => setTimeout(r, MIRROR_SETTLE_MS));
 
-            // Explicitly create a pipeline for the PR branch.
-            // GitLab will use the latest commit on that ref (which is now our SHA
-            // after the mirror synced it).
-            console.log(`\nCreating GitLab pipeline for branch '${prBranch}'...`);
-            let createdPipeline = null;
-            try {
-              createdPipeline = await glFetch(
-                "POST",
-                `/projects/${projectId}/pipeline`,
-                { ref: prBranch }
-              );
-              console.log(`  Pipeline created: #${createdPipeline.id} status=${createdPipeline.status}`);
+            // ── Step 4: Poll loop — retry pipeline creation until it succeeds ──
+            //
+            // Pipeline creation fails with "Reference not found" when the mirror
+            // hasn't synced the branch yet. Instead of giving up after one attempt,
+            // we retry creation every poll interval until it succeeds, then track
+            // that pipeline to completion.
 
-              await postGitHubStatus(
-                "pending",
-                `GitLab pipeline #${createdPipeline.id} is ${createdPipeline.status}…`,
-                `${projectUrl}/-/pipelines/${createdPipeline.id}`
-              );
-            } catch (err) {
-              // Pipeline creation can fail if the branch doesn't exist in GitLab yet
-              // (mirror hasn't synced). Fall through to polling which will also check.
-              core.warning(`Explicit pipeline creation failed: ${err.message}. Will poll for any pipeline on this branch.`);
-            }
-
-            // ── Step 4: Poll for pipeline matching our exact SHA ───────────────
             const TERMINAL_STATUSES    = new Set(["success", "failed", "canceled", "skipped", "blocked"]);
             const IN_PROGRESS_STATUSES = new Set(["created", "waiting_for_resource", "preparing", "pending", "running"]);
 
-            let pipeline = null;
-            let elapsed  = 0;
+            let pipeline   = null;
+            let pipelineId = null;   // set once pipeline is successfully created
+            let elapsed    = 0;
 
-            // If we created a pipeline, poll it directly by ID for efficiency.
-            // If creation failed, fall back to scanning all pipelines for the branch.
-            const pollById = createdPipeline?.id ?? null;
-
-            console.log(`\nPolling GitLab for pipeline on '${prBranch}' SHA=${prSha}...`);
+            console.log(`\nStarting pipeline creation + poll loop for branch '${prBranch}'...`);
 
             while (elapsed < MAX_WAIT_MS) {
               await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
               elapsed += POLL_INTERVAL_MS;
 
-              try {
-                if (pollById) {
-                  // Poll the specific pipeline we created
-                  const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pollById}`);
-                  const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
-
-                  console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`);
-
-                  if (IN_PROGRESS_STATUSES.has(p.status)) {
-                    await postGitHubStatus(
-                      "pending",
-                      `GitLab pipeline #${p.id} is ${p.status}…`,
-                      pipelineUrl
-                    );
-                  }
-
-                  if (TERMINAL_STATUSES.has(p.status)) {
-                    pipeline = p;
-                    console.log(`  Pipeline finished: ${p.status}`);
-                    break;
-                  }
-                } else {
-                  // Fallback: scan all pipelines for the branch and match by SHA
-                  const pipelines = await glFetch(
-                    "GET",
-                    `/projects/${projectId}/pipelines` +
-                    `?ref=${encodeURIComponent(prBranch)}&per_page=10`
+              // If we don't have a pipeline yet, keep trying to create one
+              if (!pipelineId) {
+                try {
+                  const created = await glFetch(
+                    "POST",
+                    `/projects/${projectId}/pipeline`,
+                    { ref: prBranch }
                   );
+                  pipelineId = created.id;
+                  console.log(
+                    `  [${Math.round(elapsed / 1000)}s] Pipeline created: #${pipelineId} status=${created.status}`
+                  );
+                  await postGitHubStatus(
+                    "pending",
+                    `GitLab pipeline #${pipelineId} is ${created.status}…`,
+                    `${projectUrl}/-/pipelines/${pipelineId}`
+                  );
+                } catch (err) {
+                  // "Reference not found" = mirror still syncing, retry next tick
+                  console.log(
+                    `  [${Math.round(elapsed / 1000)}s] Pipeline creation failed (mirror may still be syncing): ${err.message}`
+                  );
+                  continue;
+                }
+              }
 
-                  const exact = pipelines.find(p => p.sha === prSha);
+              // Poll the pipeline we created
+              try {
+                const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pipelineId}`);
+                const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
 
-                  if (exact) {
-                    const pipelineUrl = `${projectUrl}/-/pipelines/${exact.id}`;
-                    console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${exact.id} status=${exact.status}`);
+                console.log(
+                  `  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`
+                );
 
-                    if (IN_PROGRESS_STATUSES.has(exact.status)) {
-                      await postGitHubStatus(
-                        "pending",
-                        `GitLab pipeline #${exact.id} is ${exact.status}…`,
-                        pipelineUrl
-                      );
-                    }
+                if (IN_PROGRESS_STATUSES.has(p.status)) {
+                  await postGitHubStatus(
+                    "pending",
+                    `GitLab pipeline #${p.id} is ${p.status}…`,
+                    pipelineUrl
+                  );
+                }
 
-                    if (TERMINAL_STATUSES.has(exact.status)) {
-                      pipeline = exact;
-                      console.log(`  Pipeline finished: ${exact.status}`);
-                      break;
-                    }
-                  } else {
-                    console.log(
-                      `  [${Math.round(elapsed / 1000)}s] No pipeline for this SHA yet ` +
-                      `(${pipelines.length} recent pipelines for branch).`
-                    );
-                  }
+                if (TERMINAL_STATUSES.has(p.status)) {
+                  pipeline = p;
+                  console.log(`  Pipeline finished: ${p.status}`);
+                  break;
                 }
               } catch (err) {
-                core.warning(`Poll failed (will retry): ${err.message}`);
+                core.warning(`Pipeline poll failed (will retry): ${err.message}`);
               }
             }
 
