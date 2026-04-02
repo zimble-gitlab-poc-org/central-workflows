@@ -158,7 +158,7 @@ jobs:
             // ── Step 2: Post "pending" immediately ────────────────────────────
             await postGitHubStatus(
               "pending",
-              "Waiting for GitLab CI pipeline…",
+              "Waiting for GitLab mirror to sync…",
               `${projectUrl}/-/pipelines`
             );
 
@@ -174,18 +174,18 @@ jobs:
             console.log(`Waiting ${MIRROR_SETTLE_MS / 1000}s for mirror to settle...`);
             await new Promise(r => setTimeout(r, MIRROR_SETTLE_MS));
 
-            // ── Step 4: Poll loop ─────────────────────────────────────────────
+            // ── Step 4: Poll loop ──────────────────────────────────────────────
             //
             // Each iteration:
-            //   a) Try to create a pipeline for the PR branch.
-            //   b) If creation fails ("Reference not found") the mirror hasn't
-            //      synced yet — retry next tick.
-            //   c) If creation succeeds but the pipeline SHA != prSha, the mirror
-            //      synced an older commit — cancel that stale pipeline and retry.
-            //      This was the core bug: a pipeline on the wrong SHA would pass
-            //      and report success to GitHub for code it never actually tested.
-            //   d) Once we have a pipeline whose SHA matches prSha, track it to
-            //      completion and post the real result back to GitHub.
+            //   a) Check the branch SHA in GitLab via the branches API.
+            //      This is a read-only call — no pipelines are created yet.
+            //   b) If the branch doesn't exist yet or SHA doesn't match prSha,
+            //      the mirror hasn't synced our commit — wait and retry.
+            //   c) Once the SHA matches, create the pipeline exactly once and
+            //      track it to completion.
+            //
+            // This avoids creating any stale pipelines that would clutter the
+            // GitLab pipeline list with canceled jobs.
 
             const TERMINAL_STATUSES    = new Set(["success", "failed", "canceled", "skipped", "blocked"]);
             const IN_PROGRESS_STATUSES = new Set(["created", "waiting_for_resource", "preparing", "pending", "running"]);
@@ -194,83 +194,81 @@ jobs:
             let pipelineId = null;
             let elapsed    = 0;
 
-            console.log(`\nStarting pipeline creation + poll loop for branch '${prBranch}' SHA=${prSha}...`);
+            console.log(`\nWaiting for GitLab branch '${prBranch}' to reach SHA ${prSha.slice(0, 8)}...`);
 
             while (elapsed < MAX_WAIT_MS) {
               await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
               elapsed += POLL_INTERVAL_MS;
 
-              // Try to create a pipeline if we don't have a valid one yet
-              if (!pipelineId) {
+              // If we already have a pipeline, skip straight to polling it
+              if (pipelineId) {
                 try {
-                  const created = await glFetch(
-                    "POST",
-                    `/projects/${projectId}/pipeline`,
-                    { ref: prBranch }
-                  );
+                  const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pipelineId}`);
+                  const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
 
-                  // ── SHA check ──────────────────────────────────────────────
-                  // The pipeline was created against whatever commit GitLab
-                  // currently has for this branch. If the mirror hasn't fetched
-                  // our commit yet, this will be an older SHA.
-                  if (created.sha !== prSha) {
-                    console.log(
-                      `  [${Math.round(elapsed / 1000)}s] Pipeline #${created.id} created but SHA mismatch` +
-                      ` (got ${created.sha.slice(0, 8)}, want ${prSha.slice(0, 8)}).` +
-                      ` Mirror hasn't synced yet — canceling stale pipeline and retrying.`
+                  console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`);
+
+                  if (IN_PROGRESS_STATUSES.has(p.status)) {
+                    await postGitHubStatus(
+                      "pending",
+                      `GitLab pipeline #${p.id} is ${p.status}…`,
+                      pipelineUrl
                     );
-                    // Cancel the stale pipeline so it doesn't waste runner resources
-                    try {
-                      await glFetch("POST", `/projects/${projectId}/pipelines/${created.id}/cancel`);
-                    } catch (cancelErr) {
-                      core.warning(`Could not cancel stale pipeline: ${cancelErr.message}`);
-                    }
-                    continue;  // retry next tick
                   }
 
-                  // SHA matches — this is the pipeline we want
-                  pipelineId = created.id;
-                  console.log(
-                    `  [${Math.round(elapsed / 1000)}s] Pipeline created: #${pipelineId} SHA=${created.sha.slice(0, 8)} status=${created.status}`
-                  );
-                  await postGitHubStatus(
-                    "pending",
-                    `GitLab pipeline #${pipelineId} is ${created.status}…`,
-                    `${projectUrl}/-/pipelines/${pipelineId}`
-                  );
+                  if (TERMINAL_STATUSES.has(p.status)) {
+                    pipeline = p;
+                    console.log(`  Pipeline finished: ${p.status}`);
+                    break;
+                  }
                 } catch (err) {
-                  // "Reference not found" = mirror still syncing, retry next tick
-                  console.log(
-                    `  [${Math.round(elapsed / 1000)}s] Pipeline creation failed (mirror may still be syncing): ${err.message}`
-                  );
-                  continue;
+                  core.warning(`Pipeline poll failed (will retry): ${err.message}`);
                 }
+                continue;
               }
 
-              // Poll the pipeline we created
+              // Check whether GitLab's branch tip has reached our SHA yet
               try {
-                const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pipelineId}`);
-                const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
-
-                console.log(
-                  `  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`
+                const branch = await glFetch(
+                  "GET",
+                  `/projects/${projectId}/repository/branches/${encodeURIComponent(prBranch)}`
                 );
 
-                if (IN_PROGRESS_STATUSES.has(p.status)) {
-                  await postGitHubStatus(
-                    "pending",
-                    `GitLab pipeline #${p.id} is ${p.status}…`,
-                    pipelineUrl
+                const gitlabSha = branch.commit.id;
+
+                if (gitlabSha !== prSha) {
+                  console.log(
+                    `  [${Math.round(elapsed / 1000)}s] Mirror not synced yet` +
+                    ` (GitLab has ${gitlabSha.slice(0, 8)}, waiting for ${prSha.slice(0, 8)})`
                   );
+                  continue;  // wait for next tick, no pipeline created
                 }
 
-                if (TERMINAL_STATUSES.has(p.status)) {
-                  pipeline = p;
-                  console.log(`  Pipeline finished: ${p.status}`);
-                  break;
-                }
+                // SHA matches — safe to create the pipeline now
+                console.log(
+                  `  [${Math.round(elapsed / 1000)}s] Mirror synced ✓ SHA=${gitlabSha.slice(0, 8)} — creating pipeline...`
+                );
+
+                const created = await glFetch(
+                  "POST",
+                  `/projects/${projectId}/pipeline`,
+                  { ref: prBranch }
+                );
+
+                pipelineId = created.id;
+                console.log(`  Pipeline created: #${pipelineId} status=${created.status}`);
+
+                await postGitHubStatus(
+                  "pending",
+                  `GitLab pipeline #${pipelineId} is ${created.status}…`,
+                  `${projectUrl}/-/pipelines/${pipelineId}`
+                );
+
               } catch (err) {
-                core.warning(`Pipeline poll failed (will retry): ${err.message}`);
+                // Branch doesn't exist yet in GitLab (mirror hasn't synced at all)
+                console.log(
+                  `  [${Math.round(elapsed / 1000)}s] Branch not found in GitLab yet — mirror still syncing.`
+                );
               }
             }
 
