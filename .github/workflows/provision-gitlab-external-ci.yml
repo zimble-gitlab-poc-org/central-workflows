@@ -1,0 +1,185 @@
+name: Provision GitLab External CI
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update GitLab project for external CI/CD
+        uses: actions/github-script@v7
+        env:
+          GITLAB_HOST:               ${{ secrets.GITLAB_HOST }}
+          GITLAB_API_TOKEN:          ${{ secrets.GITLAB_API_TOKEN }}
+          GITLAB_TOP_LEVEL_GROUP_ID: ${{ secrets.GITLAB_TOP_LEVEL_GROUP_ID }}
+          GITLAB_ORG_SUBGROUP:       ${{ secrets.GITLAB_ORG_SUBGROUP }}
+          MIRROR_USERNAME:           ${{ secrets.MIRROR_USERNAME }}
+          MIRROR_TOKEN:              ${{ secrets.MIRROR_TOKEN }}
+        with:
+          script: |
+            const GITLAB_HOST        = process.env.GITLAB_HOST;
+            const GITLAB_API_TOKEN   = process.env.GITLAB_API_TOKEN;
+            const TOP_LEVEL_GROUP_ID = process.env.GITLAB_TOP_LEVEL_GROUP_ID;
+            const ORG_SUBGROUP       = process.env.GITLAB_ORG_SUBGROUP;
+            const MIRROR_USERNAME    = process.env.MIRROR_USERNAME;
+            const MIRROR_TOKEN       = process.env.MIRROR_TOKEN;
+
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+
+            console.log("----- GitLab External CI Provisioning Started -----");
+            console.log("Repo:", repoFullName);
+
+            // ─── 1. Read topics ────────────────────────────────────────────────
+            const { data: topicData } = await github.rest.repos.getAllTopics({
+              owner: context.repo.owner,
+              repo:  context.repo.repo
+            });
+
+            const topics = topicData.names;
+            console.log("Topics found:", topics);
+
+            function extractTopic(prefix) {
+              const match = topics.find(t => t.startsWith(`${prefix}-`));
+              return match ? match.slice(prefix.length + 1) : null;
+            }
+
+            const product = extractTopic("product");
+            const aspect  = extractTopic("aspect");
+            const name    = extractTopic("repo");
+            const tenant  = extractTopic("tenant");
+
+            if (!product || !aspect || !name) {
+              core.setFailed(`Could not extract required topics. Found: ${topics.join(", ")}`);
+              return;
+            }
+
+            console.log(`Product : ${product}`);
+            console.log(`Aspect  : ${aspect}`);
+            console.log(`Name    : ${name}`);
+            console.log(`Tenant  : ${tenant ?? "none"}`);
+
+            // ─── 2. GitLab API helpers ─────────────────────────────────────────
+            async function glFetch(method, path, body) {
+              const res = await fetch(`${GITLAB_HOST}/api/v4${path}`, {
+                method,
+                headers: {
+                  "PRIVATE-TOKEN": GITLAB_API_TOKEN,
+                  "Content-Type":  "application/json"
+                },
+                ...(body ? { body: JSON.stringify(body) } : {})
+              });
+
+              if (res.status === 204) return null;
+
+              const data = await res.json();
+              if (!res.ok) {
+                throw new Error(`GitLab API [${method} ${path}]: ${JSON.stringify(data)}`);
+              }
+              return data;
+            }
+
+            async function findOrCreateGroup(parentId, groupPath, groupName) {
+              const res = await fetch(
+                `${GITLAB_HOST}/api/v4/groups/${parentId}/subgroups` +
+                `?search=${encodeURIComponent(groupPath)}&per_page=100`,
+                { headers: { "PRIVATE-TOKEN": GITLAB_API_TOKEN } }
+              );
+              const subgroups = await res.json();
+              const existing  = subgroups.find(g => g.path === groupPath || g.name === groupPath);
+
+              if (existing) {
+                console.log(`  ✅ Found group  : ${existing.full_path} (id=${existing.id})`);
+                return existing;
+              }
+
+              console.log(`  ➕ Creating group: ${groupName} under parent ${parentId}`);
+              const created = await glFetch("POST", "/groups", {
+                name:       groupName,
+                path:       groupPath,
+                parent_id:  parseInt(parentId),
+                visibility: "private"
+              });
+              console.log(`  ✅ Created group : ${created.full_path} (id=${created.id})`);
+              return created;
+            }
+
+            // ─── 3. Build nested group hierarchy ──────────────────────────────
+            console.log("\nResolving GitLab group hierarchy...");
+
+            const secondLevelPath = tenant ?? ORG_SUBGROUP;
+            const secondLevel     = await findOrCreateGroup(TOP_LEVEL_GROUP_ID, secondLevelPath, secondLevelPath);
+            const productGroup    = await findOrCreateGroup(secondLevel.id, product, product);
+            const aspectGroup     = await findOrCreateGroup(productGroup.id, aspect, aspect);
+
+            // ─── 4. Find or create the project ────────────────────────────────
+            console.log(`\nLooking for project '${name}' in ${aspectGroup.full_path}...`);
+
+            const projectsRes = await fetch(
+              `${GITLAB_HOST}/api/v4/groups/${aspectGroup.id}/projects` +
+              `?search=${encodeURIComponent(name)}&per_page=100`,
+              { headers: { "PRIVATE-TOKEN": GITLAB_API_TOKEN } }
+            );
+            const projects  = await projectsRes.json();
+            const existing  = projects.find(p => p.path === name || p.name === name);
+
+            const authCloneUrl =
+              `https://${MIRROR_USERNAME}:${MIRROR_TOKEN}@github.com/${repoFullName}.git`;
+
+            let projectId, projectUrl;
+
+            if (existing) {
+              projectId  = existing.id;
+              projectUrl = existing.web_url;
+              console.log(`Found existing project: ${projectUrl} (id=${projectId})`);
+
+              // Update the import URL in case credentials have rotated.
+              // For external CI projects this keeps the connection live.
+              try {
+                await glFetch("PUT", `/projects/${projectId}`, {
+                  import_url: authCloneUrl
+                });
+                console.log("  Import URL updated.");
+              } catch (err) {
+                core.warning(
+                  `Could not update import URL (may be a regular project, not external-CI): ${err.message}`
+                );
+              }
+
+            } else {
+              // ── Create project in "CI/CD for external repository" mode ─────
+              //
+              // ci_cd_only: true tells GitLab this project exists purely to run
+              // pipelines against the external GitHub repository. GitLab will:
+              //   • not store the full repo content
+              //   • set up a webhook on the GitHub repo so pushes trigger pipelines
+              //   • expose the project only in the CI/CD context
+              //
+              // The MIRROR_TOKEN used in authCloneUrl must have the
+              // `admin:repo_hook` scope so GitLab can register the GitHub webhook.
+              console.log(`Creating project '${name}' as external-CI project...`);
+              const created = await glFetch("POST", "/projects", {
+                name,
+                path:         name,
+                namespace_id: aspectGroup.id,
+                visibility:   "private",
+                import_url:   authCloneUrl,
+                ci_cd_only:   true
+              });
+              projectId  = created.id;
+              projectUrl = created.web_url;
+              console.log(`  Project created: ${projectUrl} (id=${projectId})`);
+
+              // GitLab imports asynchronously — wait briefly for it to initialise
+              // before returning so the caller workflow can dispatch pipelines.
+              console.log("  Waiting 15 s for import to initialise...");
+              await new Promise(r => setTimeout(r, 15_000));
+            }
+
+            console.log(`\nGitLab project : ${projectUrl}`);
+            console.log(`Source repo    : https://github.com/${repoFullName}.git`);
+            console.log("External CI/CD provisioning complete ✅");
