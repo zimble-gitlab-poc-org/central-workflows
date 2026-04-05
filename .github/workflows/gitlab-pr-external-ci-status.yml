@@ -1,0 +1,301 @@
+name: GitLab External CI Status Bridge
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Relay GitLab external-CI pipeline status to this PR commit
+        uses: actions/github-script@v7
+        env:
+          GITLAB_HOST:               ${{ secrets.GITLAB_HOST }}
+          GITLAB_API_TOKEN:          ${{ secrets.GITLAB_API_TOKEN }}
+          GITLAB_TOP_LEVEL_GROUP_ID: ${{ secrets.GITLAB_TOP_LEVEL_GROUP_ID }}
+          GITLAB_ORG_SUBGROUP:       ${{ secrets.GITLAB_ORG_SUBGROUP }}
+        with:
+          script: |
+            const GITLAB_HOST        = process.env.GITLAB_HOST;
+            const GITLAB_API_TOKEN   = process.env.GITLAB_API_TOKEN;
+            const TOP_LEVEL_GROUP_ID = process.env.GITLAB_TOP_LEVEL_GROUP_ID;
+            const ORG_SUBGROUP       = process.env.GITLAB_ORG_SUBGROUP;
+
+            const STATUS_CONTEXT   = "gitlab-ci/external-pipeline";
+            const POLL_INTERVAL_MS = 20_000;
+            const MAX_WAIT_MS      = 30 * 60_000;
+
+            const prSha    = context.payload.pull_request.head.sha;
+            const prBranch = context.payload.pull_request.head.ref;
+            const prNumber = context.payload.pull_request.number;
+
+            console.log(`PR #${prNumber}  branch=${prBranch}  sha=${prSha}`);
+
+            // ── GitHub commit status helper ────────────────────────────────────
+            async function postGitHubStatus(state, description, targetUrl = "") {
+              await github.rest.repos.createCommitStatus({
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                sha:         prSha,
+                state,
+                description: description.slice(0, 140),
+                context:     STATUS_CONTEXT,
+                ...(targetUrl ? { target_url: targetUrl } : {})
+              });
+              console.log(`  → GitHub status [${state}]: ${description}`);
+            }
+
+            // ── GitLab API helper ──────────────────────────────────────────────
+            async function glFetch(method, path, body) {
+              const res = await fetch(`${GITLAB_HOST}/api/v4${path}`, {
+                method,
+                headers: {
+                  "PRIVATE-TOKEN": GITLAB_API_TOKEN,
+                  "Content-Type":  "application/json"
+                },
+                ...(body ? { body: JSON.stringify(body) } : {})
+              });
+
+              if (res.status === 204) return null;
+
+              const data = await res.json();
+              if (!res.ok) {
+                throw new Error(
+                  `GitLab API [${method} ${path}] → ${res.status}: ${JSON.stringify(data)}`
+                );
+              }
+              return data;
+            }
+
+            // ── Step 1: Resolve GitLab project from repo topics ────────────────
+            const { data: topicData } = await github.rest.repos.getAllTopics({
+              owner: context.repo.owner,
+              repo:  context.repo.repo
+            });
+
+            const topics = topicData.names;
+
+            function extractTopic(prefix) {
+              const match = topics.find(t => t.startsWith(`${prefix}-`));
+              return match ? match.slice(prefix.length + 1) : null;
+            }
+
+            const product = extractTopic("product");
+            const aspect  = extractTopic("aspect");
+            const name    = extractTopic("repo");
+            const tenant  = extractTopic("tenant");
+
+            if (!product || !aspect || !name) {
+              const msg = `Cannot resolve GitLab project — missing topics. Found: ${topics.join(", ")}`;
+              await postGitHubStatus("error", msg);
+              core.setFailed(msg);
+              return;
+            }
+
+            console.log(`GitLab path: ${tenant ?? ORG_SUBGROUP}/${product}/${aspect}/${name}`);
+
+            async function findSubgroup(parentId, path) {
+              const res = await fetch(
+                `${GITLAB_HOST}/api/v4/groups/${parentId}/subgroups` +
+                `?search=${encodeURIComponent(path)}&per_page=100`,
+                { headers: { "PRIVATE-TOKEN": GITLAB_API_TOKEN } }
+              );
+              const groups = await res.json();
+              return groups.find(g => g.path === path || g.name === path) ?? null;
+            }
+
+            const secondLevelPath = tenant ?? ORG_SUBGROUP;
+            const secondLevel     = await findSubgroup(TOP_LEVEL_GROUP_ID, secondLevelPath);
+            if (!secondLevel) {
+              const msg = `GitLab group '${secondLevelPath}' not found.`;
+              await postGitHubStatus("error", msg);
+              core.setFailed(msg);
+              return;
+            }
+
+            const productGroup = await findSubgroup(secondLevel.id, product);
+            if (!productGroup) {
+              const msg = `GitLab group '${product}' not found.`;
+              await postGitHubStatus("error", msg);
+              core.setFailed(msg);
+              return;
+            }
+
+            const aspectGroup = await findSubgroup(productGroup.id, aspect);
+            if (!aspectGroup) {
+              const msg = `GitLab group '${aspect}' not found.`;
+              await postGitHubStatus("error", msg);
+              core.setFailed(msg);
+              return;
+            }
+
+            const projRes = await fetch(
+              `${GITLAB_HOST}/api/v4/groups/${aspectGroup.id}/projects` +
+              `?search=${encodeURIComponent(name)}&per_page=100`,
+              { headers: { "PRIVATE-TOKEN": GITLAB_API_TOKEN } }
+            );
+            const projects  = await projRes.json();
+            const glProject = projects.find(p => p.path === name || p.name === name);
+
+            if (!glProject) {
+              const msg = `GitLab project '${name}' not found. Has provisioning run yet?`;
+              await postGitHubStatus("error", msg);
+              core.setFailed(msg);
+              return;
+            }
+
+            const projectId  = glProject.id;
+            const projectUrl = glProject.web_url;
+            console.log(`GitLab project: ${projectUrl} (id=${projectId})`);
+
+            // ── Step 2: Post "pending" immediately ────────────────────────────
+            await postGitHubStatus(
+              "pending",
+              "Waiting for GitLab to pick up the push via webhook…",
+              `${projectUrl}/-/pipelines`
+            );
+
+            // ── Step 3: Poll loop ──────────────────────────────────────────────
+            //
+            // With external CI/CD, GitLab creates pipelines automatically via the
+            // GitHub webhook it registered during provisioning. We do NOT trigger
+            // a mirror refresh or create a pipeline ourselves — we simply wait for
+            // GitLab's pipeline to appear and then track it to completion.
+            //
+            // The first phase scans the project's pipeline list for a pipeline
+            // whose SHA matches the PR head commit. Once found, the second phase
+            // polls that pipeline until it reaches a terminal state.
+
+            const TERMINAL_STATUSES    = new Set(["success", "failed", "canceled", "skipped", "blocked"]);
+            const IN_PROGRESS_STATUSES = new Set(["created", "waiting_for_resource", "preparing", "pending", "running"]);
+
+            let pipeline   = null;
+            let pipelineId = null;
+            let elapsed    = 0;
+
+            console.log(
+              `\nPolling for GitLab pipeline on branch '${prBranch}' ` +
+              `matching SHA ${prSha.slice(0, 8)}...`
+            );
+
+            while (elapsed < MAX_WAIT_MS) {
+              await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+              elapsed += POLL_INTERVAL_MS;
+
+              // ── Phase 2: pipeline found — poll it to completion ──────────────
+              if (pipelineId) {
+                try {
+                  const p = await glFetch("GET", `/projects/${projectId}/pipelines/${pipelineId}`);
+                  const pipelineUrl = `${projectUrl}/-/pipelines/${p.id}`;
+
+                  console.log(`  [${Math.round(elapsed / 1000)}s] Pipeline #${p.id} status=${p.status}`);
+
+                  if (IN_PROGRESS_STATUSES.has(p.status)) {
+                    await postGitHubStatus(
+                      "pending",
+                      `GitLab pipeline #${p.id} is ${p.status}…`,
+                      pipelineUrl
+                    );
+                  }
+
+                  if (TERMINAL_STATUSES.has(p.status)) {
+                    pipeline = p;
+                    console.log(`  Pipeline finished: ${p.status}`);
+                    break;
+                  }
+                } catch (err) {
+                  core.warning(`Pipeline poll failed (will retry): ${err.message}`);
+                }
+                continue;
+              }
+
+              // ── Phase 1: look for a pipeline GitLab auto-created for this SHA ─
+              //
+              // GitLab may take a few seconds after the GitHub webhook fires to
+              // create the pipeline entry. We keep retrying until it appears or
+              // we hit MAX_WAIT_MS.
+              try {
+                const pipelines = await glFetch(
+                  "GET",
+                  `/projects/${projectId}/pipelines` +
+                  `?ref=${encodeURIComponent(prBranch)}&per_page=20`
+                );
+
+                // The pipelines list is ordered most-recent-first; find the one
+                // whose SHA exactly matches our PR head commit.
+                const found = pipelines.find(p => p.sha === prSha);
+
+                if (found) {
+                  pipelineId = found.id;
+                  const pipelineUrl = `${projectUrl}/-/pipelines/${pipelineId}`;
+
+                  console.log(
+                    `  [${Math.round(elapsed / 1000)}s] ` +
+                    `Found pipeline #${pipelineId} status=${found.status}`
+                  );
+
+                  await postGitHubStatus(
+                    "pending",
+                    `GitLab pipeline #${pipelineId} is ${found.status}…`,
+                    pipelineUrl
+                  );
+
+                  // Pipeline may already be terminal (e.g. instant failure)
+                  if (TERMINAL_STATUSES.has(found.status)) {
+                    pipeline = found;
+                    break;
+                  }
+                } else {
+                  console.log(
+                    `  [${Math.round(elapsed / 1000)}s] ` +
+                    `No pipeline yet for SHA ${prSha.slice(0, 8)} on '${prBranch}' — webhook may still be in flight.`
+                  );
+                }
+              } catch (err) {
+                core.warning(`Pipeline search failed (will retry): ${err.message}`);
+              }
+            }
+
+            // ── Step 4: Post final result back to GitHub ───────────────────────
+            if (!pipeline) {
+              await postGitHubStatus(
+                "error",
+                "GitLab pipeline did not appear or complete within the timeout.",
+                `${projectUrl}/-/pipelines`
+              );
+              core.setFailed("Timed out waiting for GitLab external-CI pipeline.");
+              return;
+            }
+
+            const pipelineUrl = `${projectUrl}/-/pipelines/${pipeline.id}`;
+
+            const STATUS_MAP = {
+              success:  "success",
+              failed:   "failure",
+              canceled: "failure",
+              skipped:  "success",
+              blocked:  "pending"
+            };
+
+            const ghState = STATUS_MAP[pipeline.status] ?? "error";
+
+            const DESCRIPTIONS = {
+              success: `GitLab pipeline #${pipeline.id} passed ✓`,
+              failure: `GitLab pipeline #${pipeline.id} failed ✗`,
+              pending: `GitLab pipeline #${pipeline.id} requires manual action`,
+              error:   `GitLab pipeline #${pipeline.id} ended with unexpected status: ${pipeline.status}`
+            };
+
+            await postGitHubStatus(ghState, DESCRIPTIONS[ghState], pipelineUrl);
+
+            if (ghState !== "success" && ghState !== "pending") {
+              core.setFailed(`GitLab pipeline ${pipeline.status}. See: ${pipelineUrl}`);
+            } else {
+              console.log(`\n✅ Done. GitHub commit status set to '${ghState}'.`);
+            }
