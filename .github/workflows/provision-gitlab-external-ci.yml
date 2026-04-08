@@ -34,6 +34,11 @@ jobs:
             console.log("----- GitLab External CI Provisioning Started -----");
             console.log("Repo:", repoFullName);
 
+            if (!MIRROR_TOKEN) {
+              core.setFailed("MIRROR_TOKEN secret is required to register the GitHub webhook.");
+              return;
+            }
+
             // ─── 1. Read topics ────────────────────────────────────────────────
             const { data: topicData } = await github.rest.repos.getAllTopics({
               owner: context.repo.owner,
@@ -64,6 +69,17 @@ jobs:
             console.log(`Tenant  : ${tenant ?? "none"}`);
 
             // ─── 2. GitLab API helpers ─────────────────────────────────────────
+            async function readApiBody(res) {
+              const text = await res.text();
+              if (!text) return null;
+
+              try {
+                return JSON.parse(text);
+              } catch {
+                return text;
+              }
+            }
+
             async function glFetch(method, path, body) {
               const res = await fetch(`${GITLAB_HOST}/api/v4${path}`, {
                 method,
@@ -76,9 +92,48 @@ jobs:
 
               if (res.status === 204) return null;
 
-              const data = await res.json();
+              const data = await readApiBody(res);
               if (!res.ok) {
                 throw new Error(`GitLab API [${method} ${path}]: ${JSON.stringify(data)}`);
+              }
+              return data;
+            }
+
+            async function glFormFetch(method, path, body) {
+              const res = await fetch(`${GITLAB_HOST}/api/v4${path}`, {
+                method,
+                headers: {
+                  "PRIVATE-TOKEN": GITLAB_API_TOKEN
+                },
+                body: new URLSearchParams(body)
+              });
+
+              if (res.status === 204) return null;
+
+              const data = await readApiBody(res);
+              if (!res.ok) {
+                throw new Error(`GitLab API [${method} ${path}]: ${JSON.stringify(data)}`);
+              }
+              return data;
+            }
+
+            async function ghFetch(method, path, body) {
+              const res = await fetch(`https://api.github.com${path}`, {
+                method,
+                headers: {
+                  "Authorization":        `Bearer ${MIRROR_TOKEN}`,
+                  "Accept":               "application/vnd.github+json",
+                  "Content-Type":         "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28"
+                },
+                ...(body ? { body: JSON.stringify(body) } : {})
+              });
+
+              if (res.status === 204) return null;
+
+              const data = await readApiBody(res);
+              if (!res.ok) {
+                throw new Error(`GitHub API [${method} ${path}]: ${JSON.stringify(data)}`);
               }
               return data;
             }
@@ -138,7 +193,7 @@ jobs:
               console.log(`Found existing project: ${projectUrl} (id=${projectId})`);
 
               // Update the import URL in case credentials have rotated.
-              // For external CI projects this keeps the connection live.
+              // For the fallback external-CI setup this keeps mirroring/auth valid.
               try {
                 await glFetch("PUT", `/projects/${projectId}`, {
                   import_url: authCloneUrl
@@ -146,29 +201,24 @@ jobs:
                 console.log("  Import URL updated.");
               } catch (err) {
                 core.warning(
-                  `Could not update import URL (may be a regular project, not external-CI): ${err.message}`
+                  `Could not update import URL: ${err.message}`
                 );
               }
 
             } else {
-              // ── Create project in "CI/CD for external repository" mode ─────
+              // ── Create a regular project as the fallback external-CI target ─
               //
-              // ci_cd_only: true tells GitLab this project exists purely to run
-              // pipelines against the external GitHub repository. GitLab will:
-              //   • not store the full repo content
-              //   • set up a webhook on the GitHub repo so pushes trigger pipelines
-              //   • expose the project only in the CI/CD context
-              //
-              // The MIRROR_TOKEN used in authCloneUrl must have the
-              // `admin:repo_hook` scope so GitLab can register the GitHub webhook.
-              console.log(`Creating project '${name}' as external-CI project...`);
+              // Some GitLab instances ignore ci_cd_only when projects are created
+              // through the API. We therefore create a normal project, enable
+              // pull mirroring explicitly, and register the GitHub webhook
+              // ourselves below.
+              console.log(`Creating project '${name}' for external-CI fallback mode...`);
               const created = await glFetch("POST", "/projects", {
                 name,
                 path:         name,
                 namespace_id: aspectGroup.id,
                 visibility:   "private",
-                import_url:   authCloneUrl,
-                ci_cd_only:   true
+                import_url:   authCloneUrl
               });
               projectId  = created.id;
               projectUrl = created.web_url;
@@ -178,6 +228,91 @@ jobs:
               // before returning so the caller workflow can dispatch pipelines.
               console.log("  Waiting 15 s for import to initialise...");
               await new Promise(r => setTimeout(r, 15_000));
+            }
+
+            // ─── 5. Configure pull mirroring explicitly ───────────────────────
+            //
+            // When ci_cd_only is ignored by the GitLab API, GitLab does not set
+            // up the external-repository linkage for us. Enabling pull mirroring
+            // keeps the project connected to GitHub, while the webhook below
+            // gives us immediate pipeline triggers.
+            console.log("\nConfiguring pull mirroring...");
+            try {
+              await glFetch("PUT", `/projects/${projectId}/mirror/pull`, {
+                enabled:        true,
+                trigger_builds: false,
+                url:            authCloneUrl
+              });
+              console.log("  Pull mirroring enabled/updated.");
+            } catch (err) {
+              core.warning(`Could not enable pull mirroring: ${err.message}`);
+            }
+
+            // ─── 6. Create/reuse a GitLab trigger token ───────────────────────
+            console.log("\nEnsuring GitLab pipeline trigger token exists...");
+
+            let triggerToken = null;
+            try {
+              const triggers = await glFetch("GET", `/projects/${projectId}/triggers`);
+              const existingTrigger = triggers.find(
+                t => t.description === "GitHub webhook trigger" &&
+                  typeof t.token === "string" &&
+                  t.token.length > 8
+              );
+
+              if (existingTrigger) {
+                triggerToken = existingTrigger.token;
+                console.log("  Reusing existing pipeline trigger token.");
+              }
+            } catch (err) {
+              core.warning(`Could not list existing trigger tokens: ${err.message}`);
+            }
+
+            if (!triggerToken) {
+              const trigger = await glFormFetch("POST", `/projects/${projectId}/triggers`, {
+                description: "GitHub webhook trigger"
+              });
+              triggerToken = trigger.token;
+              console.log("  Pipeline trigger token created.");
+            }
+
+            // ─── 7. Create/update the GitHub webhook ourselves ────────────────
+            //
+            // We subscribe only to push events here. The PR bridge workflow
+            // still runs on pull_request events inside GitHub, but the GitLab
+            // pipeline itself should be created from the push payload so GitLab
+            // receives the branch ref that actually moved.
+            console.log("\nSetting up GitHub → GitLab webhook...");
+
+            const webhookBaseUrl = `${GITLAB_HOST}/api/v4/projects/${projectId}/trigger/pipeline`;
+            const webhookUrl     = `${webhookBaseUrl}?token=${encodeURIComponent(triggerToken)}`;
+
+            const hooks = await ghFetch("GET", `/repos/${repoFullName}/hooks?per_page=100`);
+            const existingHook = hooks.find(
+              hook => hook.name === "web" &&
+                typeof hook.config?.url === "string" &&
+                hook.config.url.startsWith(webhookBaseUrl)
+            );
+
+            const hookBody = {
+              active: true,
+              events: ["push"],
+              config: {
+                url:          webhookUrl,
+                content_type: "json",
+                insecure_ssl: "0"
+              }
+            };
+
+            if (existingHook) {
+              await ghFetch("PATCH", `/repos/${repoFullName}/hooks/${existingHook.id}`, hookBody);
+              console.log("  GitHub webhook updated.");
+            } else {
+              await ghFetch("POST", `/repos/${repoFullName}/hooks`, {
+                name: "web",
+                ...hookBody
+              });
+              console.log("  GitHub webhook created.");
             }
 
             console.log(`\nGitLab project : ${projectUrl}`);

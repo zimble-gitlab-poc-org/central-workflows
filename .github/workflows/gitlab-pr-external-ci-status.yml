@@ -30,10 +30,13 @@ jobs:
             const STATUS_CONTEXT   = "gitlab-ci/external-pipeline";
             const POLL_INTERVAL_MS = 20_000;
             const MAX_WAIT_MS      = 30 * 60_000;
+            const FALLBACK_WINDOW_MS = 3 * 60_000;
 
             const prSha    = context.payload.pull_request.head.sha;
             const prBranch = context.payload.pull_request.head.ref;
             const prNumber = context.payload.pull_request.number;
+            const pollStartedAt = Date.now();
+            const fallbackStart = new Date(pollStartedAt - FALLBACK_WINDOW_MS).toISOString();
 
             console.log(`PR #${prNumber}  branch=${prBranch}  sha=${prSha}`);
 
@@ -178,6 +181,7 @@ jobs:
             let pipeline   = null;
             let pipelineId = null;
             let elapsed    = 0;
+            let matchedBy  = "sha";
 
             console.log(
               `\nPolling for GitLab pipeline on branch '${prBranch}' ` +
@@ -199,7 +203,9 @@ jobs:
                   if (IN_PROGRESS_STATUSES.has(p.status)) {
                     await postGitHubStatus(
                       "pending",
-                      `GitLab pipeline #${p.id} is ${p.status}…`,
+                      matchedBy === "sha"
+                        ? `GitLab pipeline #${p.id} is ${p.status}…`
+                        : `GitLab trigger pipeline #${p.id} is ${p.status}…`,
                       pipelineUrl
                     );
                   }
@@ -215,11 +221,14 @@ jobs:
                 continue;
               }
 
-              // ── Phase 1: look for a pipeline GitLab auto-created for this SHA ─
+              // ── Phase 1: look for the best matching pipeline ─────────────────
               //
-              // GitLab may take a few seconds after the GitHub webhook fires to
-              // create the pipeline entry. We keep retrying until it appears or
-              // we hit MAX_WAIT_MS.
+              // Prefer an exact SHA match first. On GitLab instances where
+              // external-repository mode is unavailable, the GitHub webhook
+              // creates a trigger-token pipeline instead. Those pipelines do not
+              // always expose the GitHub SHA in the pipeline list immediately, so
+              // we fall back to the newest trigger pipeline for the same branch
+              // that appeared around the time this bridge started.
               try {
                 const pipelines = await glFetch(
                   "GET",
@@ -227,22 +236,30 @@ jobs:
                   `?ref=${encodeURIComponent(prBranch)}&per_page=20`
                 );
 
-                // The pipelines list is ordered most-recent-first; find the one
-                // whose SHA exactly matches our PR head commit.
-                const found = pipelines.find(p => p.sha === prSha);
+                const foundBySha = pipelines.find(p => p.sha === prSha);
+                const fallback = pipelines.find(
+                  p => p.source === "trigger" &&
+                    new Date(p.created_at ?? p.updated_at ?? 0).toISOString() >= fallbackStart
+                );
+
+                const found = foundBySha ?? fallback;
 
                 if (found) {
+                  matchedBy  = foundBySha ? "sha" : "trigger-fallback";
                   pipelineId = found.id;
                   const pipelineUrl = `${projectUrl}/-/pipelines/${pipelineId}`;
 
                   console.log(
                     `  [${Math.round(elapsed / 1000)}s] ` +
-                    `Found pipeline #${pipelineId} status=${found.status}`
+                    `Found pipeline #${pipelineId} status=${found.status}` +
+                    (matchedBy === "sha" ? "" : " (matched via trigger fallback)")
                   );
 
                   await postGitHubStatus(
                     "pending",
-                    `GitLab pipeline #${pipelineId} is ${found.status}…`,
+                    matchedBy === "sha"
+                      ? `GitLab pipeline #${pipelineId} is ${found.status}…`
+                      : `Tracking GitLab trigger pipeline #${pipelineId} on '${prBranch}'…`,
                     pipelineUrl
                   );
 
@@ -254,7 +271,7 @@ jobs:
                 } else {
                   console.log(
                     `  [${Math.round(elapsed / 1000)}s] ` +
-                    `No pipeline yet for SHA ${prSha.slice(0, 8)} on '${prBranch}' — webhook may still be in flight.`
+                    `No matching pipeline yet for SHA ${prSha.slice(0, 8)} on '${prBranch}' — webhook may still be in flight.`
                   );
                 }
               } catch (err) {
