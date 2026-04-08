@@ -22,6 +22,11 @@ jobs:
           MIRROR_TOKEN:              ${{ secrets.MIRROR_TOKEN }}
         with:
           script: |
+            // CONFIG — update if the central-workflows repo is renamed/moved
+            const CENTRAL_REPO   = "central-workflows";
+            const CENTRAL_BRANCH = "main";
+            const CENTRAL_OWNER  = context.repo.owner;
+
             const GITLAB_HOST        = process.env.GITLAB_HOST;
             const GITLAB_API_TOKEN   = process.env.GITLAB_API_TOKEN;
             const TOP_LEVEL_GROUP_ID = process.env.GITLAB_TOP_LEVEL_GROUP_ID;
@@ -174,41 +179,19 @@ jobs:
               }
             }
 
-            function resolveWorkflowSource() {
-              const workflowRef = process.env.GITHUB_WORKFLOW_REF;
-              if (!workflowRef) {
-                throw new Error("GITHUB_WORKFLOW_REF is not available; cannot locate the central workflow repository.");
-              }
-
-              const atIndex = workflowRef.lastIndexOf("@");
-              const pathMarker = "/.github/workflows/";
-              const pathIndex = workflowRef.indexOf(pathMarker);
-
-              if (atIndex === -1 || pathIndex === -1 || atIndex <= pathIndex) {
-                throw new Error(`Could not parse GITHUB_WORKFLOW_REF: ${workflowRef}`);
-              }
-
-              return {
-                repository: workflowRef.slice(0, pathIndex),
-                ref: workflowRef.slice(atIndex + 1)
-              };
-            }
-
             async function fetchCentralFile(filePath) {
-              const { repository, ref } = resolveWorkflowSource();
-              const slashIndex = repository.indexOf("/");
-              const owner = repository.slice(0, slashIndex);
-              const repo  = repository.slice(slashIndex + 1);
-
               const { data } = await github.rest.repos.getContent({
-                owner,
-                repo,
+                owner: CENTRAL_OWNER,
+                repo:  CENTRAL_REPO,
                 path: filePath,
-                ref
+                ref:   CENTRAL_BRANCH
               });
 
               if (!("content" in data) || !data.content) {
-                throw new Error(`GitHub content API returned no file content for ${repository}/${filePath}@${ref}`);
+                throw new Error(
+                  `GitHub content API returned no file content for ` +
+                  `${CENTRAL_OWNER}/${CENTRAL_REPO}/${filePath}@${CENTRAL_BRANCH}`
+                );
               }
 
               return Buffer.from(data.content, "base64").toString("utf8");
@@ -332,7 +315,11 @@ jobs:
                 console.log("  No pull mirroring URL configured; nothing to disable.");
               }
             } catch (err) {
-              core.warning(`Could not disable pull mirroring: ${err.message}`);
+              if (String(err.message).includes("The project is not mirrored")) {
+                console.log("  Project is not mirrored; nothing to disable.");
+              } else {
+                core.warning(`Could not disable pull mirroring: ${err.message}`);
+              }
             }
 
             // ─── 6. Seed GitLab CI config + project variables ─────────────────
