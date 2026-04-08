@@ -11,6 +11,8 @@ jobs:
   provision:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Create or update GitLab project for external CI/CD
         uses: actions/github-script@v7
         env:
@@ -28,6 +30,8 @@ jobs:
             const ORG_SUBGROUP       = process.env.GITLAB_ORG_SUBGROUP;
             const MIRROR_USERNAME    = process.env.MIRROR_USERNAME;
             const MIRROR_TOKEN       = process.env.MIRROR_TOKEN;
+            const fs                 = require("fs");
+            const path               = require("path");
 
             const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
 
@@ -68,6 +72,14 @@ jobs:
             console.log(`Name    : ${name}`);
             console.log(`Tenant  : ${tenant ?? "none"}`);
 
+            const { data: repoData } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo:  context.repo.repo
+            });
+            const defaultBranch = repoData.default_branch ?? "main";
+
+            console.log(`Default branch: ${defaultBranch}`);
+
             // ─── 2. GitLab API helpers ─────────────────────────────────────────
             async function readApiBody(res) {
               const text = await res.text();
@@ -94,7 +106,7 @@ jobs:
 
               const data = await readApiBody(res);
               if (!res.ok) {
-                throw new Error(`GitLab API [${method} ${path}]: ${JSON.stringify(data)}`);
+                throw new Error(`GitLab API [${method} ${path}] → ${res.status}: ${JSON.stringify(data)}`);
               }
               return data;
             }
@@ -112,9 +124,58 @@ jobs:
 
               const data = await readApiBody(res);
               if (!res.ok) {
-                throw new Error(`GitLab API [${method} ${path}]: ${JSON.stringify(data)}`);
+                throw new Error(`GitLab API [${method} ${path}] → ${res.status}: ${JSON.stringify(data)}`);
               }
               return data;
+            }
+
+            async function upsertProjectVariable(projectId, key, value, extra = {}) {
+              try {
+                await glFetch("PUT", `/projects/${projectId}/variables/${encodeURIComponent(key)}`, {
+                  value,
+                  ...extra
+                });
+                console.log(`  Updated project variable: ${key}`);
+              } catch (err) {
+                if (!String(err.message).includes("404")) throw err;
+
+                await glFetch("POST", `/projects/${projectId}/variables`, {
+                  key,
+                  value,
+                  ...extra
+                });
+                console.log(`  Created project variable: ${key}`);
+              }
+            }
+
+            async function upsertRepositoryFile(projectId, branch, filePath, content, commitMessage) {
+              const encodedPath = encodeURIComponent(filePath);
+
+              try {
+                await glFetch(
+                  "PUT",
+                  `/projects/${projectId}/repository/files/${encodedPath}`,
+                  {
+                    branch,
+                    content,
+                    commit_message: commitMessage
+                  }
+                );
+                console.log(`  Updated GitLab file: ${filePath}`);
+              } catch (err) {
+                if (!String(err.message).includes("404")) throw err;
+
+                await glFetch(
+                  "POST",
+                  `/projects/${projectId}/repository/files/${encodedPath}`,
+                  {
+                    branch,
+                    content,
+                    commit_message: commitMessage
+                  }
+                );
+                console.log(`  Created GitLab file: ${filePath}`);
+              }
             }
 
             async function ghFetch(method, path, body) {
@@ -182,73 +243,84 @@ jobs:
             const projects  = await projectsRes.json();
             const existing  = projects.find(p => p.path === name || p.name === name);
 
-            const authCloneUrl =
-              `https://${MIRROR_USERNAME}:${MIRROR_TOKEN}@github.com/${repoFullName}.git`;
-
             let projectId, projectUrl;
+            let projectDefaultBranch = defaultBranch;
 
             if (existing) {
               projectId  = existing.id;
               projectUrl = existing.web_url;
               console.log(`Found existing project: ${projectUrl} (id=${projectId})`);
 
-              // Update the import URL in case credentials have rotated.
-              // For the fallback external-CI setup this keeps mirroring/auth valid.
               try {
-                await glFetch("PUT", `/projects/${projectId}`, {
-                  import_url: authCloneUrl
-                });
-                console.log("  Import URL updated.");
+                const project = await glFetch("GET", `/projects/${projectId}`);
+                projectDefaultBranch = project.default_branch ?? defaultBranch;
               } catch (err) {
-                core.warning(
-                  `Could not update import URL: ${err.message}`
-                );
+                core.warning(`Could not read project details: ${err.message}`);
               }
 
             } else {
-              // ── Create a regular project as the fallback external-CI target ─
+              // ── Create a lightweight GitLab project for trigger-only CI ─────
               //
-              // Some GitLab instances ignore ci_cd_only when projects are created
-              // through the API. We therefore create a normal project, enable
-              // pull mirroring explicitly, and register the GitHub webhook
-              // ourselves below.
-              console.log(`Creating project '${name}' for external-CI fallback mode...`);
+              // The removed ci_cd_only API mode used to create a special
+              // "external repository CI" project. We now emulate that model by
+              // using a normal GitLab project that stores only CI config while
+              // GitHub remains the source of truth for code.
+              console.log(`Creating project '${name}' for trigger-only external CI...`);
               const created = await glFetch("POST", "/projects", {
                 name,
                 path:         name,
                 namespace_id: aspectGroup.id,
                 visibility:   "private",
-                import_url:   authCloneUrl
+                initialize_with_readme: true
               });
               projectId  = created.id;
               projectUrl = created.web_url;
+              projectDefaultBranch = created.default_branch ?? defaultBranch;
               console.log(`  Project created: ${projectUrl} (id=${projectId})`);
-
-              // GitLab imports asynchronously — wait briefly for it to initialise
-              // before returning so the caller workflow can dispatch pipelines.
-              console.log("  Waiting 15 s for import to initialise...");
-              await new Promise(r => setTimeout(r, 15_000));
             }
 
-            // ─── 5. Configure pull mirroring explicitly ───────────────────────
-            //
-            // When ci_cd_only is ignored by the GitLab API, GitLab does not set
-            // up the external-repository linkage for us. Enabling pull mirroring
-            // keeps the project connected to GitHub, while the webhook below
-            // gives us immediate pipeline triggers.
-            console.log("\nConfiguring pull mirroring...");
+            console.log(`GitLab default branch: ${projectDefaultBranch}`);
+
+            // ─── 5. Disable pull mirroring if the project used the old fallback ─
+            console.log("\nDisabling GitLab pull mirroring for external-CI mode...");
             try {
               await glFetch("PUT", `/projects/${projectId}/mirror/pull`, {
-                enabled:        true,
-                trigger_builds: false,
-                url:            authCloneUrl
+                enabled: false
               });
-              console.log("  Pull mirroring enabled/updated.");
+              console.log("  Pull mirroring disabled.");
             } catch (err) {
-              core.warning(`Could not enable pull mirroring: ${err.message}`);
+              core.warning(`Could not disable pull mirroring: ${err.message}`);
             }
 
-            // ─── 6. Create/reuse a GitLab trigger token ───────────────────────
+            // ─── 6. Seed GitLab CI config + project variables ─────────────────
+            const templatePath = path.join(process.env.GITHUB_WORKSPACE, "templates", ".gitlab-ci.yml");
+            const gitlabCiContent = fs.readFileSync(templatePath, "utf8");
+
+            console.log("\nSeeding GitLab CI configuration...");
+            await upsertRepositoryFile(
+              projectId,
+              projectDefaultBranch,
+              ".gitlab-ci.yml",
+              gitlabCiContent,
+              "chore: sync external CI pipeline template"
+            );
+
+            console.log("\nConfiguring GitLab project variables...");
+            await upsertProjectVariable(projectId, "EXTERNAL_REPO_FULL_NAME", repoFullName);
+            await upsertProjectVariable(projectId, "EXTERNAL_REPO_CLONE_USERNAME", MIRROR_USERNAME);
+            try {
+              await upsertProjectVariable(projectId, "EXTERNAL_REPO_CLONE_TOKEN", MIRROR_TOKEN, {
+                masked: true
+              });
+            } catch (err) {
+              core.warning(
+                `Could not mask EXTERNAL_REPO_CLONE_TOKEN automatically: ${err.message}. ` +
+                "Retrying without masked=true."
+              );
+              await upsertProjectVariable(projectId, "EXTERNAL_REPO_CLONE_TOKEN", MIRROR_TOKEN);
+            }
+
+            // ─── 7. Create/reuse a GitLab trigger token ───────────────────────
             console.log("\nEnsuring GitLab pipeline trigger token exists...");
 
             let triggerToken = null;
@@ -276,12 +348,12 @@ jobs:
               console.log("  Pipeline trigger token created.");
             }
 
-            // ─── 7. Create/update the GitHub webhook ourselves ────────────────
+            // ─── 8. Create/update the GitHub webhook ourselves ────────────────
             //
-            // We subscribe only to push events here. The PR bridge workflow
-            // still runs on pull_request events inside GitHub, but the GitLab
-            // pipeline itself should be created from the push payload so GitLab
-            // receives the branch ref that actually moved.
+            // We send both push and pull_request events so the PR bridge has a
+            // fresh GitLab pipeline to track on PR open/reopen/synchronize.
+            // GitLab receives the webhook payload as TRIGGER_PAYLOAD, which the
+            // seeded .gitlab-ci.yml uses to checkout the exact GitHub ref/SHA.
             console.log("\nSetting up GitHub → GitLab webhook...");
 
             const webhookBaseUrl = `${GITLAB_HOST}/api/v4/projects/${projectId}/trigger/pipeline`;
@@ -296,7 +368,7 @@ jobs:
 
             const hookBody = {
               active: true,
-              events: ["push"],
+              events: ["push", "pull_request"],
               config: {
                 url:          webhookUrl,
                 content_type: "json",
