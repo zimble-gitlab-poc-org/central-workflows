@@ -18,6 +18,7 @@ jobs:
           GITLAB_API_TOKEN:          ${{ secrets.GITLAB_API_TOKEN }}
           GITLAB_TOP_LEVEL_GROUP_ID: ${{ secrets.GITLAB_TOP_LEVEL_GROUP_ID }}
           GITLAB_ORG_SUBGROUP:       ${{ secrets.GITLAB_ORG_SUBGROUP }}
+          HOOK_TOKEN:                ${{ secrets.HOOK_TOKEN }}
           MIRROR_USERNAME:           ${{ secrets.MIRROR_USERNAME }}
           MIRROR_TOKEN:              ${{ secrets.MIRROR_TOKEN }}
         with:
@@ -31,6 +32,7 @@ jobs:
             const GITLAB_API_TOKEN   = process.env.GITLAB_API_TOKEN;
             const TOP_LEVEL_GROUP_ID = process.env.GITLAB_TOP_LEVEL_GROUP_ID;
             const ORG_SUBGROUP       = process.env.GITLAB_ORG_SUBGROUP;
+            const HOOK_TOKEN         = process.env.HOOK_TOKEN;
             const MIRROR_USERNAME    = process.env.MIRROR_USERNAME;
             const MIRROR_TOKEN       = process.env.MIRROR_TOKEN;
 
@@ -202,14 +204,12 @@ jobs:
             }
 
             async function ghFetch(method, path, body) {
-              const basicAuth = Buffer
-                .from(`${MIRROR_USERNAME}:${MIRROR_TOKEN}`)
-                .toString("base64");
+              const hookToken = HOOK_TOKEN || MIRROR_TOKEN;
 
               const res = await fetch(`https://api.github.com${path}`, {
                 method,
                 headers: {
-                  "Authorization":        `Basic ${basicAuth}`,
+                  "Authorization":        `Bearer ${hookToken}`,
                   "Accept":               "application/vnd.github+json",
                   "Content-Type":         "application/json",
                   "X-GitHub-Api-Version": "2022-11-28"
@@ -221,6 +221,13 @@ jobs:
 
               const data = await readApiBody(res);
               if (!res.ok) {
+                if (res.status === 401) {
+                  throw new Error(
+                    `GitHub API [${method} ${path}] → 401: webhook credential was rejected. ` +
+                    `Configure HOOK_TOKEN with repo webhook-admin access, or replace MIRROR_TOKEN with one that can call the GitHub REST API. ` +
+                    `Body: ${JSON.stringify(data)}`
+                  );
+                }
                 throw new Error(`GitHub API [${method} ${path}]: ${JSON.stringify(data)}`);
               }
               return data;
